@@ -1,0 +1,138 @@
+package com.codejohn.wifivision.ui
+
+import android.app.Application
+import android.location.Location
+import android.os.Build
+import android.os.SystemClock
+import androidx.lifecycle.*
+import com.codejohn.wifivision.data.*
+import com.codejohn.wifivision.data.model.WifiSnapshot
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.text.DateFormat
+import java.util.Date
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class GeoCoverageViewModel(app:Application):AndroidViewModel(app) {
+    val db=VisionDatabase.get(app)
+    val dao=db.geoDao()
+    val projectId=MutableStateFlow<Long?>(null)
+    val sessionId=MutableStateFlow<Long?>(null)
+    val projects=dao.projects().stateIn(viewModelScope,SharingStarted.WhileSubscribed(0),emptyList())
+    val sessions=projectId.flatMapLatest { if(it==null) flowOf(emptyList()) else dao.sessions(it) }
+        .stateIn(viewModelScope,SharingStarted.WhileSubscribed(0),emptyList())
+    val points=sessionId.flatMapLatest { if(it==null) flowOf(emptyList()) else dao.points(it) }
+        .stateIn(viewModelScope,SharingStarted.WhileSubscribed(0),emptyList())
+    val wifi=AppPreferences.changes.flatMapLatest { WifiRepository(app).snapshots(AppPreferences(app).interval) }
+        .stateIn(viewModelScope,SharingStarted.WhileSubscribed(0),WifiSnapshot())
+    val tracking=MutableStateFlow(false)
+    val currentLocation=MutableStateFlow<Location?>(null)
+    val running=MutableStateFlow(false)
+    val message=MutableStateFlow("Escolha um projeto. Centralize para obter localização; inicie uma sessão para registrar.")
+    var satellite=false
+    var opacity=.55f
+    var camera:org.maplibre.android.camera.CameraPosition?=null
+    var pendingExport:android.graphics.Bitmap?=null
+    private val mutex=Mutex()
+    private var segment=0
+    private var lastElapsed=0L
+    private var invalidGap=false
+    private val recovery=viewModelScope.launch { dao.recoverSessions() }
+
+    fun createProject(name:String) = viewModelScope.launch {
+        recovery.join()
+        projectId.value=dao.createProject(GeoProject(name=name)); sessionId.value=null
+    }
+    fun selectProject(id:Long) = viewModelScope.launch {
+        pause().join(); projectId.value=id; sessionId.value=null
+    }
+    fun selectSession(id:Long) = viewModelScope.launch {
+        pause().join(); sessionId.value=id
+    }
+    fun begin(new:Boolean) = viewModelScope.launch {
+        recovery.join()
+        mutex.withLock {
+            val project=projectId.value ?: run { message.value="Crie ou abra um projeto."; return@withLock }
+            var selected=sessionId.value?.let { dao.session(it) }
+            if(new || selected==null || selected.status=="FINISHED" || selected.projectId!=project) {
+                val id=dao.createSession(GeoSession(projectId=project,
+                    name=DateFormat.getDateTimeInstance().format(Date()),status="RUNNING"))
+                sessionId.value=id; selected=dao.session(id)
+            }
+            selected ?: return@withLock
+            dao.updateSession(selected.copy(status="RUNNING"))
+            val previous=dao.lastPoint(selected.id)
+            segment=(previous?.segment ?: -1)+1
+            lastElapsed=previous?.elapsedRealtimeNanos ?: 0L
+            invalidGap=false; running.value=true; tracking.value=true
+            message.value="Coletando em primeiro plano. Limite de precisão: ±10 m."
+        }
+    }
+    fun pause() = viewModelScope.launch {
+        recovery.join()
+        mutex.withLock {
+            running.value=false
+            sessionId.value?.let { dao.session(it) }?.takeIf { it.status=="RUNNING" }?.let {
+                dao.updateSession(it.copy(status="PAUSED"))
+            }
+            message.value="Sessão pausada. Nenhuma nova medição será gravada."
+        }
+    }
+    fun finish() = viewModelScope.launch {
+        pause().join()
+        mutex.withLock {
+            sessionId.value?.let { dao.session(it) }?.let {
+                dao.updateSession(it.copy(status="FINISHED",endedAt=System.currentTimeMillis()))
+            }
+            tracking.value=false; message.value="Sessão finalizada e salva."
+        }
+    }
+    suspend fun accept(update:LocationUpdate) {
+        update.message?.let { message.value=it }
+        val location=update.location ?: return
+        currentLocation.value=location
+        mutex.withLock {
+            if(!running.value) return
+            val id=sessionId.value ?: return
+            val snapshot=wifi.value
+            val now=SystemClock.elapsedRealtime()
+            val reason=GeoQuality.rejection(
+                if(location.hasAccuracy()) location.accuracy else Float.POSITIVE_INFINITY,
+                now-location.elapsedRealtimeNanos/1_000_000,
+                now-snapshot.sampledAtElapsedMs,snapshot.rssi,snapshot.bssid)
+            if(reason!=null || snapshot.collectionError || !snapshot.isWifiConnected) {
+                message.value=reason ?: "Wi-Fi desconectado ou indisponível."
+                invalidGap=true; return
+            }
+            if(location.latitude !in -85.0..85.0) {
+                message.value="Posição fora do limite deste mapa Mercator."; invalidGap=true; return
+            }
+            val session=dao.session(id) ?: return
+            if(session.bssid!=null && session.bssid!=snapshot.bssid) {
+                message.value="O BSSID mudou. Pause e crie uma nova sessão para este ponto de acesso."
+                invalidGap=true; return
+            }
+            if(location.elapsedRealtimeNanos<=lastElapsed ||
+                location.elapsedRealtimeNanos-lastElapsed<4_000_000_000L) return
+            if(invalidGap) { segment++; invalidGap=false }
+            if(session.bssid==null) dao.updateSession(session.copy(ssid=snapshot.ssid,bssid=snapshot.bssid))
+            val mock=if(Build.VERSION.SDK_INT>=31) location.isMock else {
+                @Suppress("DEPRECATION") location.isFromMockProvider
+            }
+            dao.insertPoint(GeoMeasurement(sessionId=id,latitude=location.latitude,longitude=location.longitude,
+                accuracyMeters=location.accuracy,locationTime=location.time,
+                elapsedRealtimeNanos=location.elapsedRealtimeNanos,rssi=snapshot.rssi!!,
+                ssid=snapshot.ssid,bssid=snapshot.bssid!!,frequency=snapshot.frequencyMhz,mock=mock,segment=segment))
+            lastElapsed=location.elapsedRealtimeNanos
+            message.value="Ponto salvo: ${snapshot.rssi} dBm • precisão ±%.1f m".format(location.accuracy) +
+                if(mock) " • localização de teste/simulada" else ""
+        }
+    }
+    fun router(latitude:Double,longitude:Double) = viewModelScope.launch {
+        projects.value.firstOrNull { it.id==projectId.value }?.let {
+            dao.updateProject(it.copy(routerLatitude=latitude,routerLongitude=longitude))
+        }
+    }
+}

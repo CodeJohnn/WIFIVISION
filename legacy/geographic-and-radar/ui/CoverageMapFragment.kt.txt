@@ -1,0 +1,38 @@
+package com.codejohn.wifivision.ui
+
+import android.os.Bundle
+import android.view.*
+import android.widget.*
+import androidx.fragment.app.Fragment
+import com.codejohn.wifivision.R
+
+/** Separate geographic outdoors from manual indoor positions. Each child owns its lifecycle. */
+class CoverageMapFragment:Fragment() {
+    override fun onCreateView(inflater:LayoutInflater,container:ViewGroup?,state:Bundle?):View {
+        val ui=FeatureUi(requireContext())
+        val root=LinearLayout(requireContext()).apply {
+            orientation=LinearLayout.VERTICAL; setBackgroundColor(ui.background)
+        }
+        val modes=LinearLayout(requireContext()).apply { orientation=LinearLayout.HORIZONTAL }
+        fun mode(label:String,child:()->Fragment) {
+            val button=com.google.android.material.button.MaterialButton(requireContext()).apply {
+                text=label; isAllCaps=false
+                setOnClickListener {
+                    childFragmentManager.beginTransaction().replace(R.id.coverage_mode_container,child()).commit()
+                }
+            }
+            modes.addView(button,LinearLayout.LayoutParams(0,ui.dp(52),1f))
+        }
+        mode("Mapa externo") { GeoCoverageFragment() }
+        mode("Planta interna") { CoverageFragment() }
+        root.addView(modes)
+        root.addView(FrameLayout(requireContext()).apply { id=R.id.coverage_mode_container },
+            LinearLayout.LayoutParams(-1,0,1f))
+        return root
+    }
+    override fun onViewCreated(view:View,state:Bundle?) {
+        super.onViewCreated(view,state)
+        if(childFragmentManager.findFragmentById(R.id.coverage_mode_container)==null)
+            childFragmentManager.beginTransaction().replace(R.id.coverage_mode_container,GeoCoverageFragment()).commit()
+    }
+}

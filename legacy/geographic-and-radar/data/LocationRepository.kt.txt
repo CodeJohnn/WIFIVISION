@@ -1,0 +1,45 @@
+package com.codejohn.wifivision.data
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.location.Location
+import android.os.Looper
+import androidx.core.content.ContextCompat
+import com.google.android.gms.location.*
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.callbackFlow
+
+data class LocationUpdate(val location:Location?=null,val message:String?=null)
+
+/** Foreground only. No last-known location is ever recorded as a fresh measurement. */
+class LocationRepository(context:Context) {
+    private val app=context.applicationContext
+    fun locations() = callbackFlow {
+        val fine=ContextCompat.checkSelfPermission(app,Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED
+        val coarse=ContextCompat.checkSelfPermission(app,Manifest.permission.ACCESS_COARSE_LOCATION)==PackageManager.PERMISSION_GRANTED
+        if(!fine && !coarse) {
+            trySend(LocationUpdate(message="Autorize localização para centralizar ou mapear."))
+            close(); return@callbackFlow
+        }
+        val client=LocationServices.getFusedLocationProviderClient(app)
+        val callback=object:LocationCallback() {
+            override fun onLocationResult(result:LocationResult) {
+                result.lastLocation?.let { trySend(LocationUpdate(location=Location(it))) }
+            }
+            override fun onLocationAvailability(availability:LocationAvailability) {
+                if(!availability.isLocationAvailable)
+                    trySend(LocationUpdate(message="Localização indisponível. Vá a uma área aberta e confira o serviço de localização."))
+            }
+        }
+        try {
+            val request=LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY,5_000L)
+                .setMinUpdateIntervalMillis(2_000L).setMaxUpdateDelayMillis(0).build()
+            client.requestLocationUpdates(request,callback,Looper.getMainLooper())
+                .addOnFailureListener { trySend(LocationUpdate(message="Falha na localização: "+it.message)) }
+        } catch (_:SecurityException) {
+            trySend(LocationUpdate(message="Permissão de localização revogada."))
+        }
+        awaitClose { client.removeLocationUpdates(callback) }
+    }
+}

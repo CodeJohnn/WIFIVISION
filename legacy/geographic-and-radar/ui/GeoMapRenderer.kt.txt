@@ -1,0 +1,83 @@
+package com.codejohn.wifivision.ui
+
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.location.Location
+import com.codejohn.wifivision.data.*
+import org.json.JSONArray
+import org.json.JSONObject
+import org.maplibre.android.geometry.*
+import org.maplibre.android.maps.*
+import org.maplibre.android.style.layers.*
+import org.maplibre.android.style.layers.PropertyFactory.*
+import org.maplibre.android.style.expressions.Expression
+import org.maplibre.android.style.sources.*
+
+class GeoMapRenderer(private val map:MapLibreMap) {
+    private var style:Style?=null
+    var opacity=.55f
+    fun load(satellite:Boolean,light:Boolean,ready:()->Unit) {
+        style=null
+        val builder=if(satellite) Style.Builder().fromJson("""
+            {"version":8,"sources":{"satellite":{"type":"raster","tiles":["https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2016_3857/default/g/{z}/{y}/{x}.jpg"],"tileSize":256,"minzoom":0,"maxzoom":14,"attribution":"EOxCloudless 2016 • https://cloudless.eox.at by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2016) • CC BY 4.0"}},"layers":[{"id":"satellite","type":"raster","source":"satellite"}]}
+        """.trimIndent())
+        else Style.Builder().fromUri("https://tiles.openfreemap.org/styles/"+if(light) "liberty" else "dark")
+        map.setStyle(builder) { loaded ->
+            style=loaded
+            for(id in listOf("wifi","path","user","router")) loaded.addSource(GeoJsonSource(id,collection(emptyList())))
+            loaded.addLayer(LineLayer("survey-path","path").withProperties(lineColor("#39FF14"),lineWidth(3f),lineOpacity(.8f)))
+            loaded.addLayer(CircleLayer("wifi-points","wifi").withProperties(
+                circleRadius(6f),circleColor(Expression.get("color")),circleStrokeColor(Color.BLACK),circleStrokeWidth(1.5f)))
+            loaded.addLayer(CircleLayer("user-position","user").withProperties(
+                circleRadius(9f),circleColor("#00D5FF"),circleStrokeWidth(2f),circleStrokeColor(Color.WHITE)))
+            loaded.addLayer(CircleLayer("router-position","router").withProperties(
+                circleRadius(11f),circleColor("#00FFFF"),circleStrokeColor(Color.BLACK),circleStrokeWidth(3f)))
+            ready()
+        }
+    }
+    private fun feature(geometry:JSONObject,properties:JSONObject=JSONObject()) =
+        JSONObject().put("type","Feature").put("geometry",geometry).put("properties",properties)
+    private fun point(lon:Double,lat:Double)=JSONObject().put("type","Point")
+        .put("coordinates",JSONArray().put(lon).put(lat))
+    private fun collection(features:List<JSONObject>)=JSONObject().put("type","FeatureCollection")
+        .put("features",JSONArray(features)).toString()
+
+    fun render(points:List<GeoMeasurement>,project:GeoProject?,location:Location?) {
+        val s=style ?: return
+        val features=points.map {
+            feature(point(it.longitude,it.latitude),JSONObject()
+                .put("color",String.format("#%06X",signalColor(it.rssi.toDouble()) and 0xFFFFFF))
+                .put("detail","${it.rssi} dBm • ${it.frequency ?: "—"} MHz\n${it.ssid ?: "oculto"}\n${it.bssid}\nPrecisão ±%.1f m\n${java.util.Date(it.locationTime)}".format(it.accuracyMeters) +
+                    if(it.mock) "\nLocalização de teste/simulada" else ""))
+        }
+        s.getSourceAs<GeoJsonSource>("wifi")?.setGeoJson(collection(features))
+        val lines=points.groupBy { it.segment }.values.filter { it.size>=2 }.map { group ->
+            feature(JSONObject().put("type","LineString").put("coordinates",
+                JSONArray(group.map { JSONArray().put(it.longitude).put(it.latitude) })))
+        }
+        s.getSourceAs<GeoJsonSource>("path")?.setGeoJson(collection(lines))
+        s.getSourceAs<GeoJsonSource>("user")?.setGeoJson(collection(location?.let {
+            listOf(feature(point(it.longitude,it.latitude)))
+        } ?: emptyList()))
+        s.getSourceAs<GeoJsonSource>("router")?.setGeoJson(collection(
+            if(project?.routerLatitude!=null && project.routerLongitude!=null)
+                listOf(feature(point(project.routerLongitude,project.routerLatitude))) else emptyList()))
+    }
+    fun heat(grid:GeoHeatGrid?) {
+        val s=style ?: return
+        s.removeLayer("survey-heat")
+        s.removeSource("heat-image")
+        if(grid==null) return
+        val bitmap=Bitmap.createBitmap(grid.colors,grid.size,grid.size,Bitmap.Config.ARGB_8888)
+        val quad=LatLngQuad(LatLng(grid.north,grid.west),LatLng(grid.north,grid.east),
+            LatLng(grid.south,grid.east),LatLng(grid.south,grid.west))
+        s.addSource(ImageSource("heat-image",quad,bitmap))
+        s.addLayerBelow(RasterLayer("survey-heat","heat-image").withProperties(rasterOpacity(opacity)),"survey-path")
+    }
+    fun setTransparency(value:Float) {
+        opacity=value
+        style?.getLayerAs<RasterLayer>("survey-heat")?.setProperties(rasterOpacity(value))
+    }
+    fun detail(coordinate:LatLng):String? = map.queryRenderedFeatures(map.projection.toScreenLocation(coordinate),"wifi-points")
+        .firstOrNull()?.getStringProperty("detail")
+}

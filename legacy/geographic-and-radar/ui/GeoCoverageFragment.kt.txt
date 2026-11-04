@@ -1,0 +1,324 @@
+package com.codejohn.wifivision.ui
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.*
+import android.net.Uri
+import android.os.Bundle
+import android.os.SystemClock
+import android.provider.Settings
+import android.view.*
+import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.*
+import com.codejohn.wifivision.R
+import com.codejohn.wifivision.data.*
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import org.maplibre.android.MapLibre
+import org.maplibre.android.camera.CameraUpdateFactory
+import org.maplibre.android.geometry.*
+import org.maplibre.android.maps.*
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class GeoCoverageFragment:Fragment() {
+    private val model:GeoCoverageViewModel by activityViewModels()
+    private var mapView:MapView?=null
+    private var map:MapLibreMap?=null
+    private var renderer:GeoMapRenderer?=null
+    private var heat:GeoHeatGrid?=null
+    private var status:TextView?=null
+    private var pendingAction=""
+    private var centerOnce=false
+    private val request=registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if(result[Manifest.permission.ACCESS_FINE_LOCATION]==true) {
+            AppPreferences.changes.value++
+            executeAction()
+        } else {
+            model.message.value="Localização precisa não autorizada; a coleta externa permanece desligada."
+            if(!shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION))
+                confirm("Permissão necessária","Deseja abrir as configurações para permitir localização precisa?") {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+requireContext().packageName)))
+                }
+        }
+    }
+    private val csv=registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+        if(uri!=null) writeDocument(uri,false)
+    }
+    private val png=registerForActivityResult(ActivityResultContracts.CreateDocument("image/png")) { uri ->
+        if(uri!=null) writeDocument(uri,true) else { model.pendingExport?.recycle(); model.pendingExport=null }
+    }
+    override fun onCreate(state:Bundle?) { super.onCreate(state); pendingAction=state?.getString("pending_action") ?: "" }
+    override fun onCreateView(inflater:LayoutInflater,container:ViewGroup?,state:Bundle?):View {
+        val ui=FeatureUi(requireContext())
+        MapLibre.getInstance(requireContext())
+        val root=FrameLayout(requireContext()).apply { setBackgroundColor(Color.BLACK) }
+        val mv=MapView(requireContext()).apply { id=R.id.geo_map_view }
+        mapView=mv; mv.onCreate(state?.getBundle("map_state"))
+        root.addView(mv,FrameLayout.LayoutParams(-1,-1))
+        val top=ui.column().apply {
+            setPadding(ui.dp(12),ui.dp(4),ui.dp(12),ui.dp(4)); setBackgroundColor(ui.surface)
+        }
+        top.addView(ui.text("COBERTURA • EXTERNO",18f).apply { setTextColor(ui.accent) })
+        val project=ui.text("Crie ou abra um projeto",12f); top.addView(project)
+        status=ui.text("Mapa real • aguardando localização",11f).apply { id=R.id.geo_map_status; maxLines=4 }
+        top.addView(status)
+        val topRow=LinearLayout(requireContext())
+        smallButton(topRow,"Projetos") { projectMenu() }
+        smallButton(topRow,"Minha posição") { permission("center") }
+        smallButton(topRow,"Ruas / satélite") {
+            model.satellite=!model.satellite; loadStyle()
+        }
+        top.addView(topRow)
+        root.addView(top,FrameLayout.LayoutParams(-1,-2,Gravity.TOP).apply {
+            setMargins(ui.dp(10),ui.dp(8),ui.dp(10),0)
+        })
+        val bottom=ui.column().apply {
+            setPadding(ui.dp(12),ui.dp(4),ui.dp(12),ui.dp(4)); setBackgroundColor(ui.surface)
+        }
+        val controls=LinearLayout(requireContext())
+        val start=smallButton(controls,"Iniciar / retomar") {
+            if(model.projectId.value==null) projectMenu()
+            else confirm("Mapear com localização",
+                "A sessão salvará coordenadas, precisão, horário e RSSI localmente. Use em área externa; ±10 m não identifica cômodos. A coleta pausa ao sair desta tela. Os provedores de mapa recebem IP e área visualizada. Iniciar?") { permission("start") }
+        }
+        val pause=smallButton(controls,"Pausar") { model.pause() }
+        val finish=smallButton(controls,"Finalizar") { model.finish() }
+        bottom.addView(controls)
+        val legend=ui.text("● Verde ≥ −55 • amarelo ≥ −67 • laranja ≥ −75 • vermelho < −75 dBm\nCinza/sem sobreposição = sem dados suficientes. Pontos = medidos; superfície = estimativa.",10f)
+        bottom.addView(legend)
+        val opacity=SeekBar(requireContext()).apply { max=100; progress=(model.opacity*100).toInt(); contentDescription="Opacidade do mapa de calor" }
+        opacity.setOnSeekBarChangeListener(object:SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar:SeekBar?,progress:Int,fromUser:Boolean) {
+                model.opacity=progress/100f; renderer?.setTransparency(model.opacity)
+            }
+            override fun onStartTrackingTouch(seekBar:SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar:SeekBar?) {}
+        })
+        bottom.addView(opacity,LinearLayout.LayoutParams(-1,ui.dp(30)))
+        ui.button(bottom,"Sessões • comparar • exportar • ajuda") { actions() }
+        val credits=ui.text("© OpenStreetMap • OpenMapTiles • OpenFreeMap",10f)
+        credits.setOnClickListener { notice("Fontes cartográficas","Ruas: OpenFreeMap / OpenMapTiles / © OpenStreetMap contributors (ODbL). Satélite: EOxCloudless 2016 por EOX IT Services GmbH; dados Copernicus Sentinel modificados, CC BY 4.0. Imagem de 2016 com resolução limitada; não é imagem atual da propriedade. Não há garantia de disponibilidade dos serviços públicos.") }
+        bottom.addView(credits)
+        root.addView(bottom,FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM).apply {
+            setMargins(ui.dp(10),0,ui.dp(10),ui.dp(8))
+        })
+        val zoom=LinearLayout(requireContext()).apply { orientation=LinearLayout.VERTICAL }
+        smallButton(zoom,"+") { map?.animateCamera(CameraUpdateFactory.zoomIn()) }
+        smallButton(zoom,"−") { map?.animateCamera(CameraUpdateFactory.zoomOut()) }
+        root.addView(zoom,FrameLayout.LayoutParams(ui.dp(54),ui.dp(110),Gravity.END or Gravity.CENTER_VERTICAL))
+        mv.addOnDidFailLoadingMapListener { error -> model.message.value="Falha ao carregar mapa: $error. Dados locais preservados." }
+        mv.getMapAsync { readyMap ->
+            if(mapView!==mv) return@getMapAsync
+            map=readyMap; renderer=GeoMapRenderer(readyMap).also { it.opacity=model.opacity }
+            readyMap.uiSettings.isCompassEnabled=true
+            readyMap.uiSettings.setCompassMargins(ui.dp(8),ui.dp(220),ui.dp(8),ui.dp(8))
+            readyMap.uiSettings.setAttributionMargins(ui.dp(8),ui.dp(8),ui.dp(8),ui.dp(295))
+            readyMap.cameraPosition=model.camera ?: org.maplibre.android.camera.CameraPosition.Builder()
+                .target(LatLng(0.0,0.0)).zoom(1.0).build()
+            readyMap.addOnCameraIdleListener { model.camera=readyMap.cameraPosition }
+            readyMap.addOnMapClickListener {
+                val detail=renderer?.detail(it)
+                if(detail!=null) { notice("Medição real",detail); true } else false
+            }
+            readyMap.addOnMapLongClickListener {
+                if(model.projectId.value==null) notice("Roteador","Crie um projeto primeiro.")
+                else confirm("Posição manual do roteador","Salvar o roteador nesta coordenada? Esta posição é informada por você, não detectada pelo sinal.") {
+                    model.router(it.latitude,it.longitude)
+                }
+                true
+            }
+            loadStyle()
+        }
+        // View lifecycle starts after onCreateView, collectors are installed in onViewCreated.
+        bind={
+            val owner=viewLifecycleOwner
+            owner.lifecycleScope.launch {
+                owner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    launch { model.projects.collect {
+                        if(model.projectId.value==null && it.isNotEmpty()) model.projectId.value=it.first().id
+                    } }
+                    launch { model.sessions.collect { sessions ->
+                        if(model.sessionId.value==null && sessions.isNotEmpty()) model.sessionId.value=sessions.first().id
+                    } }
+                    launch { model.wifi.collect { } }
+                    launch { model.tracking.flatMapLatest { if(it) LocationRepository(requireContext()).locations() else emptyFlow() }
+                        .collect { update -> model.accept(update) } }
+                    launch {
+                        combine(model.projects,model.sessions,model.points,model.currentLocation) { projects,sessions,points,location ->
+                            project.text=(projects.firstOrNull { it.id==model.projectId.value }?.name ?: "Sem projeto")+" • "+
+                                (sessions.firstOrNull { it.id==model.sessionId.value }?.let { it.name+" • "+it.status } ?: "sem sessão")+" • ${points.size} pontos"
+                            Triple(projects.firstOrNull { it.id==model.projectId.value },points,location)
+                        }.collect { (p,points,location) ->
+                            renderer?.render(points,p,location)
+                            if(centerOnce && location!=null) {
+                                map?.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(location.latitude,location.longitude),18.0))
+                                centerOnce=false
+                            }
+                        }
+                    }
+                    launch { model.points.collectLatest { points ->
+                        heat=withContext(Dispatchers.Default) { GeoHeatmap.generate(points) }
+                        renderer?.heat(heat)
+                    } }
+                    launch { combine(model.message,model.currentLocation,model.running,ticks()) { message,location,running,now ->
+                        start.isEnabled=!running; pause.isEnabled=running; finish.isEnabled=model.sessionId.value!=null
+                        val age=location?.let { ((now-it.elapsedRealtimeNanos/1_000_000)/1000).coerceAtLeast(0) }
+                        val gps=location?.let { "Última posição: ±%.1f m • há ${age} s".format(it.accuracy) } ?: "Localização não obtida"
+                        message+"\n"+gps+(if(model.satellite) "\nSatélite EOX 2016 • resolução limitada" else "")
+                    }.collect { status?.text=it } }
+                }
+            }
+        }
+        return root
+    }
+    private var bind:(()->Unit)?=null
+    override fun onViewCreated(view:View,state:Bundle?) { super.onViewCreated(view,state); bind?.invoke(); bind=null }
+    private fun ticks()=flow { while(true) { emit(SystemClock.elapsedRealtime()); delay(1000) } }
+    private fun smallButton(row:LinearLayout,label:String,action:()->Unit):Button {
+        val button=com.google.android.material.button.MaterialButton(requireContext()).apply {
+            text=label; isAllCaps=false; textSize=11f
+            setPadding(4,0,4,0); setOnClickListener { action() }
+        }
+        row.addView(button,if(row.orientation==LinearLayout.VERTICAL) LinearLayout.LayoutParams(-1,0,1f)
+            else LinearLayout.LayoutParams(0,FeatureUi(requireContext()).dp(48),1f))
+        return button
+    }
+    private fun permission(action:String) {
+        pendingAction=action
+        if(ContextCompat.checkSelfPermission(requireContext(),Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED) executeAction()
+        else confirm("Localização precisa","O mapa externo usa GPS/localização para associar posição e RSSI. O modo interno continua manual. Você pode cancelar.") {
+            request.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION,Manifest.permission.ACCESS_COARSE_LOCATION))
+        }
+    }
+    private fun executeAction() {
+        when(pendingAction) {
+            "start" -> model.begin(false)
+            "new" -> model.begin(true)
+            else -> { centerOnce=true; model.tracking.value=true }
+        }
+        pendingAction=""
+    }
+    private fun loadStyle() {
+        renderer?.load(model.satellite,AppPreferences(requireContext()).light) {
+            val project=model.projects.value.firstOrNull { it.id==model.projectId.value }
+            renderer?.render(model.points.value,project,model.currentLocation.value)
+            renderer?.heat(heat)
+        }
+    }
+    private fun projectMenu() {
+        val projects=model.projects.value
+        MaterialAlertDialogBuilder(requireContext()).setTitle("Projetos externos")
+            .setItems((listOf("+ Criar projeto")+projects.map { it.name }).toTypedArray()) { _,i ->
+                if(i==0) {
+                    val input=FeatureUi(requireContext()).input("Nome da propriedade")
+                    MaterialAlertDialogBuilder(requireContext()).setTitle("Criar projeto externo").setView(input)
+                        .setPositiveButton("Salvar") { _,_ -> if(input.text.isNotBlank()) model.createProject(input.text.toString().take(80)) }
+                        .setNegativeButton("Cancelar",null).show()
+                } else {
+                    model.selectProject(projects[i-1].id); model.camera=null
+                }
+            }.show()
+    }
+    private fun actions() {
+        val items=arrayOf("Nova sessão","Abrir sessão salva","Ver pontos no mapa","Comparar sessões","Exportar todas as medições (CSV)","Exportar mapa atual (PNG)","Localização do sistema","Ajuda / precisão / fontes")
+        MaterialAlertDialogBuilder(requireContext()).setTitle("Mapeamento externo").setItems(items) { _,i ->
+            when(i) {
+                0 -> if(model.projectId.value==null) projectMenu() else confirm("Nova sessão","Iniciar nova coleta geográfica com RSSI real?") { permission("new") }
+                1 -> {
+                    val sessions=model.sessions.value
+                    if(sessions.isEmpty()) notice("Sessões","Nenhuma sessão neste projeto.")
+                    else MaterialAlertDialogBuilder(requireContext()).setTitle("Sessões").setItems(sessions.map { it.name+" • "+it.status+" • "+(it.bssid ?: "sem BSSID") }.toTypedArray()) { _,n ->
+                        model.selectSession(sessions[n].id); model.camera=null
+                    }.show()
+                }
+                2 -> focusPoints()
+                3 -> compare()
+                4 -> confirm("Exportar CSV","O arquivo contém GPS, precisão, SSID/BSSID e medições internas/externas. Escolha um destino privado.") { csv.launch("WiFiVision-medicoes.csv") }
+                5 -> exportMap()
+                6 -> startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                else -> notice("Como usar","Crie um projeto, centralize e inicie a coleta em área aberta. Só gravamos precisão ≤10 m e posições recentes. O Android pode manter cache do RSSI. Segure o mapa para posicionar o roteador; toque em pontos para detalhes. Calor = IDW dentro do contorno medido com ≥3 vizinhos em até 25 m; não é alcance físico e não considera paredes. Fora de 1 km de extensão, mostramos apenas pontos e percurso. Provedores de mapa recebem a área consultada e seu IP. Use Planta interna para cômodos. Serviços cartográficos exigem internet; medições e projetos são locais.")
+            }
+        }.show()
+    }
+    private fun focusPoints() {
+        val points=model.points.value
+        if(points.isEmpty()) { notice("Medições","A sessão ainda não possui pontos válidos."); return }
+        if(points.size==1) map?.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(points[0].latitude,points[0].longitude),18.0))
+        else {
+            val bounds=LatLngBounds.Builder()
+            points.forEach { bounds.include(LatLng(it.latitude,it.longitude)) }
+            map?.animateCamera(CameraUpdateFactory.newLatLngBounds(bounds.build(),FeatureUi(requireContext()).dp(80)))
+        }
+    }
+    private fun compare() {
+        val sessions=model.sessions.value
+        if(sessions.size<2) { notice("Comparar","Registre pelo menos duas sessões."); return }
+        MaterialAlertDialogBuilder(requireContext()).setTitle("Comparar sessão atual com")
+            .setItems(sessions.map { it.name+" • "+(it.bssid ?: "—") }.toTypedArray()) { _,n ->
+                val current=model.points.value.toList()
+                viewLifecycleOwner.lifecycleScope.launch {
+                    val other=model.dao.points(sessions[n].id).first()
+                    if(current.isEmpty() || other.isEmpty()) notice("Comparar","Uma sessão não tem medições.")
+                    else notice("Comparação aproximada",
+                        "Atual: %.1f dBm (%d pontos)\nOutra: %.1f dBm (%d pontos)\n".format(current.map { it.rssi }.average(),current.size,other.map { it.rssi }.average(),other.size)+
+                            "Médias de locais diferentes não demonstram melhora. Precisão GPS e variação do ambiente limitam a comparação. Selecione cada sessão para comparar as superfícies visualmente.")
+                }
+            }.show()
+    }
+    private fun exportMap() {
+        val target=map ?: return
+        target.snapshot { bitmap ->
+            if(!isAdded) return@snapshot
+            // Preserve SDK attribution; add an explicit measurement/estimate legend.
+            val output=Bitmap.createBitmap(bitmap.width,bitmap.height+110,Bitmap.Config.ARGB_8888)
+            val c=Canvas(output); c.drawColor(Color.BLACK); c.drawBitmap(bitmap,0f,0f,null)
+            val paint=Paint(Paint.ANTI_ALIAS_FLAG).apply { color=Color.WHITE; textSize=20f }
+            c.drawText("WiFi VISION • pontos medidos / superfície interpolada",16f,bitmap.height+30f,paint)
+            c.drawText(if(model.satellite) "EOxCloudless 2016 • EOX • Copernicus Sentinel 2016 • CC BY 4.0" else "© OpenStreetMap contributors • OpenMapTiles • OpenFreeMap",16f,bitmap.height+60f,paint)
+            c.drawText("Verde ≥−55 • amarelo ≥−67 • laranja ≥−75 • vermelho <−75 dBm • cinza sem dados",16f,bitmap.height+90f,paint)
+            model.pendingExport=output; png.launch("WiFiVision-externo.png")
+        }
+    }
+    private fun writeDocument(uri:Uri,image:Boolean) {
+        val app=requireContext().applicationContext
+        val bitmap=if(image) model.pendingExport.also { model.pendingExport=null } else null
+        lifecycleScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    app.contentResolver.openOutputStream(uri,"wt")?.use { out ->
+                        if(image) check(bitmap?.compress(Bitmap.CompressFormat.PNG,100,out)==true)
+                        else out.write(SurveyCsv.all(model.db).toByteArray(Charsets.UTF_8))
+                    } ?: error("Destino indisponível.")
+                }
+                if(isAdded) notice("Exportado","Arquivo salvo.")
+            } catch(e:Exception) {
+                if(e is CancellationException) throw e
+                if(isAdded) notice("Falha na exportação",e.message ?: "Erro de gravação")
+            } finally { bitmap?.recycle() }
+        }
+    }
+    override fun onStart() { super.onStart(); mapView?.onStart() }
+    override fun onResume() { super.onResume(); mapView?.onResume() }
+    override fun onPause() { mapView?.onPause(); super.onPause() }
+    override fun onStop() {
+        model.camera=map?.cameraPosition
+        if(!requireActivity().isChangingConfigurations) { model.pause(); model.tracking.value=false }
+        mapView?.onStop(); super.onStop()
+    }
+    override fun onSaveInstanceState(out:Bundle) {
+        out.putString("pending_action",pendingAction)
+        val mapState=Bundle(); mapView?.onSaveInstanceState(mapState); out.putBundle("map_state",mapState)
+        super.onSaveInstanceState(out)
+    }
+    override fun onLowMemory() { super.onLowMemory(); mapView?.onLowMemory() }
+    override fun onDestroyView() {
+        mapView?.onDestroy(); mapView=null; map=null; renderer=null; status=null
+        super.onDestroyView()
+    }
+}

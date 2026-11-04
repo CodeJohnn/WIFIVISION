@@ -1,0 +1,130 @@
+package com.codejohn.wifivision.ui
+
+import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.os.SystemClock
+import android.provider.Settings
+import android.view.*
+import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.*
+import com.codejohn.wifivision.data.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlin.math.*
+
+class RadarFragment : Fragment() {
+    private val refresh = MutableStateFlow(0)
+    private val permission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (result[Manifest.permission.ACCESS_FINE_LOCATION] == true) refresh.value++
+        else if (!shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION)) {
+            confirm("Permissão indisponível", "A lista exige localização precisa. Deseja abrir as configurações do app?") {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + requireContext().packageName)))
+            }
+        }
+    }
+    private var bindView: (() -> Unit)? = null
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        bindView?.invoke()
+        bindView = null
+    }
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, state: Bundle?): View {
+        val ui = FeatureUi(requireContext()); val column = ui.column()
+        ui.title(column, "RADAR Wi-Fi 3D")
+        column.addView(ui.text("Distribuição NÃO GEOGRÁFICA. Ângulos, altura e raio são recursos visuais; não representam direção, distância ou localização dos roteadores. Cor = RSSI medido. Arraste para girar; pinça para zoom."))
+        val radar = RadarView(requireContext())
+        column.addView(radar, LinearLayout.LayoutParams(-1, ui.dp(300)))
+        val status = ui.text(""); column.addView(status)
+        ui.button(column, "Autorizar / atualizar") {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.ACCESS_FINE_LOCATION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED) refresh.value++
+            else confirm("Localização para Wi-Fi",
+                "O Android exige localização precisa e o serviço de localização ligado para listar SSID/BSSID. Não usamos GPS. Você pode cancelar.") {
+                permission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+            }
+        }
+        ui.button(column, "Abrir localização do sistema") {
+            startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+        }
+        column.addView(ui.text("Solicitações a cada 35 s enquanto esta aba está visível. O Android pode limitar ou atrasar; idade indica o tempo desde a medição."))
+        val list = ui.text("Aguardando…"); column.addView(list)
+        bindView = {
+            val owner = viewLifecycleOwner
+            owner.lifecycleScope.launch {
+                owner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    refresh.flatMapLatest { RadarRepository(requireContext()).observe() }.collect { s ->
+                        status.text = s.message; radar.points = s.points; radar.invalidate()
+                        val now = SystemClock.elapsedRealtime()
+                        list.text = s.points.joinToString("\n\n") {
+                            val age = ((now - it.timestampMicros / 1000L).coerceAtLeast(0) / 1000)
+                            "${it.ssid}\n${it.bssid}\n${it.frequency} MHz • ${it.rssi} dBm • há ${age} s"
+                        }.ifEmpty { "Sem pontos de acesso para exibir." }
+                    }
+                }
+            }
+        }
+        return ui.scroll(column)
+    }
+}
+
+fun signalColor(rssi: Double): Int = when {
+    rssi >= -55 -> android.graphics.Color.rgb(57,255,20)
+    rssi >= -67 -> android.graphics.Color.YELLOW
+    rssi >= -75 -> android.graphics.Color.rgb(255,138,31)
+    else -> android.graphics.Color.rgb(255,59,59)
+}
+
+class RadarView(context: android.content.Context) : View(context) {
+    var points: List<AccessPoint> = emptyList()
+    private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+    private var angle = 0f
+    private var zoom = 1f
+    private var lastX = 0f
+    private val scale = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            zoom = (zoom * detector.scaleFactor).coerceIn(.5f, 2f); invalidate(); return true
+        }
+    })
+    init { isClickable = true; contentDescription = "Radar indicativo não geográfico. Arraste para girar e use pinça para ampliar. Lista textual abaixo." }
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        scale.onTouchEvent(e)
+        when(e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { lastX = e.x; parent.requestDisallowInterceptTouchEvent(true) }
+            MotionEvent.ACTION_MOVE -> { if (!scale.isInProgress) angle += (e.x-lastX)/100f; lastX=e.x; invalidate() }
+            MotionEvent.ACTION_UP -> { parent.requestDisallowInterceptTouchEvent(false); performClick() }
+            MotionEvent.ACTION_CANCEL -> parent.requestDisallowInterceptTouchEvent(false)
+        }
+        return true
+    }
+    override fun performClick(): Boolean { super.performClick(); return true }
+    override fun onDraw(c: android.graphics.Canvas) {
+        super.onDraw(c)
+        val radius = min(width,height)*.4f*zoom
+        val cx=width/2f; val cy=height*.58f
+        paint.color = AppPreferences(context).accent; paint.style=android.graphics.Paint.Style.STROKE; paint.strokeWidth=2f
+        for (i in 1..4) {
+            val r=radius*i/4
+            c.drawOval(cx-r,cy-r*.45f,cx+r,cy+r*.45f,paint)
+        }
+        val sweep = if (AppPreferences(context).animations) SystemClock.uptimeMillis()/900.0 else 0.0
+        c.drawLine(cx,cy,cx+cos(sweep).toFloat()*radius,cy+sin(sweep).toFloat()*radius*.45f,paint)
+        paint.style=android.graphics.Paint.Style.FILL
+        for (p in points) {
+            val hash = p.bssid.hashCode().toLong() and 0x7fffffffL
+            val theta = (hash % 360)*PI/180 + angle
+            val r = radius*(.3f+(hash % 60)/100f)
+            val x=cx+cos(theta).toFloat()*r
+            val y=cy+sin(theta).toFloat()*r*.45f
+            val z=radius*(.12f+(hash%25)/100f)
+            paint.color=signalColor(p.rssi.toDouble())
+            c.drawLine(x,y,x,y-z,paint); c.drawCircle(x,y-z,8f,paint)
+            paint.textSize=24f
+            c.drawText(p.ssid.take(12)+" "+p.rssi, x+10,y-z,paint)
+        }
+        if (isShown && AppPreferences(context).animations) postInvalidateDelayed(40)
+    }
+}

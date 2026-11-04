@@ -1,0 +1,190 @@
+package com.codejohn.wifivision.ui
+
+import android.content.Context
+import android.graphics.*
+import android.view.*
+import com.codejohn.wifivision.data.*
+import org.json.JSONArray
+import kotlin.math.*
+
+/** 2D plan and schematic 3D projection. RSSI height is a visualization, never wave propagation. */
+class HeatmapView(context:Context):View(context) {
+    var map:FloorMap?=null
+    var points=emptyList<Measurement>()
+    var floorImage:Bitmap?=null
+    var heat:Bitmap?=null
+    var elevations=FloatArray(0)
+    var threeD=false
+    var editMode=false
+    var alphaHeat=.65f
+    var onPosition:((Float,Float)->Unit)?=null
+    var onMeasurement:((Measurement)->Unit)?=null
+    private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
+    private val transform=Matrix()
+    private var zoom=1f; private var yaw=0f; private var tilt=35f
+    private var panX=0f; private var panY=0f
+    private var downX=0f; private var downY=0f; private var lastX=0f; private var lastY=0f
+    private var moved=false
+    private var hitTargets=emptyList<Triple<Measurement,Float,Float>>()
+    private val scale=ScaleGestureDetector(context,object:ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector:ScaleGestureDetector):Boolean {
+            zoom=(zoom*detector.scaleFactor).coerceIn(.4f,5f); moved=true; invalidate(); return true
+        }
+    })
+    init { isClickable=true; contentDescription="Planta manual. Toque para medir ou consultar pontos. Pinça amplia; arraste move em 2D ou gira/inclina em 3D." }
+    fun rotate() { yaw+=15f; invalidate() }
+    fun tiltBy(amount:Float) { tilt=(tilt+amount).coerceIn(15f,75f); invalidate() }
+    fun zoomBy(factor:Float) { zoom=(zoom*factor).coerceIn(.4f,5f); invalidate() }
+    fun resetCamera() { zoom=1f; yaw=0f; tilt=35f; panX=0f; panY=0f; invalidate() }
+    override fun onTouchEvent(e:MotionEvent):Boolean {
+        scale.onTouchEvent(e)
+        when(e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX=e.x; downY=e.y; lastX=e.x; lastY=e.y; moved=false
+                parent.requestDisallowInterceptTouchEvent(true)
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> moved=true
+            MotionEvent.ACTION_MOVE -> {
+                if(hypot(e.x-downX,e.y-downY)>12*resources.displayMetrics.density) moved=true
+                if(moved && !scale.isInProgress && e.pointerCount==1) {
+                    if(threeD) { yaw+=(e.x-lastX)*.3f; tilt=(tilt+(e.y-lastY)*.15f).coerceIn(15f,75f) }
+                    else { panX+=e.x-lastX; panY+=e.y-lastY }
+                    invalidate()
+                }
+                lastX=e.x; lastY=e.y
+            }
+            MotionEvent.ACTION_UP -> {
+                if(!moved) {
+                    val target=hitTargets.minByOrNull { hypot(it.second-e.x,it.third-e.y) }
+                    if(!editMode && target!=null && hypot(target.second-e.x,target.third-e.y)<24*resources.displayMetrics.density)
+                        onMeasurement?.invoke(target.first)
+                    else if(!threeD) {
+                        val inverse=Matrix()
+                        if(transform.invert(inverse)) {
+                            val xy=floatArrayOf(e.x,e.y); inverse.mapPoints(xy)
+                            if(xy[0] in 0f..1000f && xy[1] in 0f..1000f) onPosition?.invoke(xy[0]/1000,xy[1]/1000)
+                        }
+                    }
+                    performClick()
+                }
+                parent.requestDisallowInterceptTouchEvent(false)
+            }
+            MotionEvent.ACTION_CANCEL -> parent.requestDisallowInterceptTouchEvent(false)
+        }
+        return true
+    }
+    override fun performClick():Boolean { super.performClick(); return true }
+    override fun onDraw(c:Canvas) {
+        super.onDraw(c); hitTargets=emptyList()
+        val m=map ?: return
+        if(threeD) { draw3D(c,m); return }
+        val ratio=m.heightMeters/m.widthMeters
+        val base=min(width/1000f,height/(1000f*ratio))*.88f*zoom
+        transform.reset(); transform.postTranslate(-500f,-500f)
+        transform.postScale(base,base*ratio); transform.postRotate(yaw)
+        transform.postTranslate(width/2f+panX,height/2f+panY)
+        c.save(); c.concat(transform)
+        paint.color=Color.rgb(55,60,55); paint.style=Paint.Style.FILL; paint.alpha=255
+        c.drawRect(0f,0f,1000f,1000f,paint)
+        floorImage?.let { c.drawBitmap(it,null,RectF(0f,0f,1000f,1000f),paint) }
+        heat?.let {
+            paint.alpha=(alphaHeat*255).toInt()
+            c.drawBitmap(it,null,RectF(0f,0f,1000f,1000f),paint); paint.alpha=255
+        }
+        paint.style=Paint.Style.STROKE; paint.strokeWidth=4f; paint.color=AppPreferences(context).accent
+        c.drawRect(0f,0f,1000f,1000f,paint)
+        val rooms=JSONArray(m.roomsJson)
+        for(i in 0 until rooms.length()) {
+            val r=rooms.getJSONObject(i)
+            val x1=r.getDouble("x1").toFloat()*1000; val y1=r.getDouble("y1").toFloat()*1000
+            val x2=r.getDouble("x2").toFloat()*1000; val y2=r.getDouble("y2").toFloat()*1000
+            paint.style=Paint.Style.STROKE
+            if(r.optString("kind")=="wall") { paint.strokeWidth=8f; c.drawLine(x1,y1,x2,y2,paint); paint.strokeWidth=4f }
+            else {
+                c.drawRect(x1,y1,x2,y2,paint); paint.style=Paint.Style.FILL; paint.textSize=28f
+                c.drawText(r.getString("name"),x1+6,y1+35,paint)
+            }
+        }
+        paint.style=Paint.Style.FILL; paint.textSize=26f
+        hitTargets=points.map { p ->
+            paint.color=signalColor(p.rssi.toDouble())
+            c.drawCircle(p.x*1000,p.y*1000,12f,paint)
+            c.drawText(p.rssi.toString(),p.x*1000+14,p.y*1000,paint)
+            val xy=floatArrayOf(p.x*1000,p.y*1000); transform.mapPoints(xy)
+            Triple(p,xy[0],xy[1])
+        }
+        if(m.routerX!=null && m.routerY!=null) {
+            paint.color=Color.CYAN; c.drawCircle(m.routerX*1000,m.routerY*1000,18f,paint)
+            c.drawText("R",m.routerX*1000+20,m.routerY*1000,paint)
+        }
+        c.restore()
+    }
+    private fun draw3D(c:Canvas,m:FloorMap) {
+        val theta=yaw*PI/180; val pitch=tilt*PI/180
+        val size=min(width,height)*.8f*zoom
+        val maxMeters=max(m.widthMeters,m.heightMeters)
+        fun project(x:Float,y:Float,z:Float):PointF {
+            val a=(x-.5f)*m.widthMeters/maxMeters; val b=(y-.5f)*m.heightMeters/maxMeters
+            val rx=(a*cos(theta)-b*sin(theta)).toFloat()
+            val ry=(a*sin(theta)+b*cos(theta)).toFloat()
+            return PointF(width/2f+panX+rx*size,
+                height*.62f+panY+ry*size*sin(pitch).toFloat()-z*size*cos(pitch).toFloat())
+        }
+        val corners=listOf(project(0f,0f,0f),project(1f,0f,0f),project(1f,1f,0f),project(0f,1f,0f))
+        val basePath=Path().apply {
+            moveTo(corners[0].x,corners[0].y); corners.drop(1).forEach { lineTo(it.x,it.y) }; close()
+        }
+        paint.color=Color.rgb(55,60,55); paint.style=Paint.Style.FILL; paint.alpha=255
+        c.drawPath(basePath,paint)
+        floorImage?.let { bitmap ->
+            val matrix=Matrix()
+            val source=floatArrayOf(0f,0f,bitmap.width.toFloat(),0f,bitmap.width.toFloat(),bitmap.height.toFloat(),0f,bitmap.height.toFloat())
+            val target=corners.flatMap { listOf(it.x,it.y) }.toFloatArray()
+            if(matrix.setPolyToPoly(source,0,target,0,4)) c.drawBitmap(bitmap,matrix,paint)
+        }
+        heat?.let { bitmap ->
+            val cells=(0 until bitmap.height).flatMap { y->(0 until bitmap.width).map { x->x to y } }
+                .sortedBy { it.first*sin(theta)+it.second*cos(theta) }
+            paint.alpha=(alphaHeat*255).toInt()
+            for((x,y) in cells) {
+                val color=bitmap.getPixel(x,y)
+                val z=if(color==Color.rgb(70,75,70)) 0f else elevations.getOrElse(y*bitmap.width+x) { 0f }
+                val p=project(x.toFloat()/bitmap.width,y.toFloat()/bitmap.height,z)
+                paint.color=color; paint.alpha=(alphaHeat*255).toInt()
+                c.drawCircle(p.x,p.y,(size/bitmap.width*.8f).coerceAtLeast(2f),paint)
+            }
+            paint.alpha=255
+        }
+        // Wall height is schematic 2.6 m, not inferred from Wi-Fi.
+        val rooms=JSONArray(m.roomsJson)
+        val edges=mutableListOf<FloatArray>()
+        for(i in 0 until rooms.length()) {
+            val r=rooms.getJSONObject(i)
+            val x1=r.getDouble("x1").toFloat(); val y1=r.getDouble("y1").toFloat()
+            val x2=r.getDouble("x2").toFloat(); val y2=r.getDouble("y2").toFloat()
+            if(r.optString("kind")=="wall") edges.add(floatArrayOf(x1,y1,x2,y2))
+            else {
+                edges.add(floatArrayOf(x1,y1,x2,y1)); edges.add(floatArrayOf(x2,y1,x2,y2))
+                edges.add(floatArrayOf(x2,y2,x1,y2)); edges.add(floatArrayOf(x1,y2,x1,y1))
+            }
+        }
+        edges.sortedBy { (it[0]+it[2])*sin(theta)+(it[1]+it[3])*cos(theta) }.forEach { e ->
+            val low1=project(e[0],e[1],0f); val low2=project(e[2],e[3],0f)
+            val high1=project(e[0],e[1],2.6f/maxMeters); val high2=project(e[2],e[3],2.6f/maxMeters)
+            val wall=Path().apply { moveTo(low1.x,low1.y); lineTo(low2.x,low2.y); lineTo(high2.x,high2.y); lineTo(high1.x,high1.y); close() }
+            paint.style=Paint.Style.FILL; paint.color=Color.argb(95,55,90,60); c.drawPath(wall,paint)
+            paint.style=Paint.Style.STROKE; paint.strokeWidth=2f; paint.color=AppPreferences(context).accent; c.drawPath(wall,paint)
+        }
+        paint.style=Paint.Style.FILL
+        hitTargets=points.map { p ->
+            val v=project(p.x,p.y,((p.rssi+100)/70f).coerceIn(0f,1f)*.7f)
+            paint.color=signalColor(p.rssi.toDouble()); c.drawCircle(v.x,v.y,6f,paint)
+            paint.color=Color.WHITE; paint.textSize=24f; c.drawText(p.rssi.toString(),v.x+8,v.y,paint)
+            Triple(p,v.x,v.y)
+        }
+        if(m.routerX!=null && m.routerY!=null) {
+            val p=project(m.routerX,m.routerY,0f)
+            paint.color=Color.CYAN; c.drawCircle(p.x,p.y,10f,paint); c.drawText("R",p.x+12,p.y,paint)
+        }
+    }
+}

@@ -1,0 +1,75 @@
+package com.codejohn.wifivision.data
+
+import android.Manifest
+import android.content.*
+import android.content.pm.PackageManager
+import android.location.LocationManager
+import android.net.wifi.WifiManager
+import android.os.SystemClock
+import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.launch
+
+data class AccessPoint(val ssid: String, val bssid: String, val frequency: Int,
+    val rssi: Int, val timestampMicros: Long)
+data class RadarState(val points: List<AccessPoint> = emptyList(), val message: String = "")
+
+class RadarRepository(context: Context) {
+    private val app = context.applicationContext
+    private val wifi = app.getSystemService(WifiManager::class.java)
+    private val prefs = AppPreferences(app)
+    fun observe() = callbackFlow {
+        fun read(message: String) {
+            try {
+                if (ContextCompat.checkSelfPermission(app, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                    trySend(RadarState(message = "Autorize localização precisa para listar redes.")); return
+                }
+                if (!LocationManagerCompat.isLocationEnabled(app.getSystemService(LocationManager::class.java))) {
+                    trySend(RadarState(message = "Ative a localização do sistema para varrer redes.")); return
+                }
+                @Suppress("DEPRECATION")
+                val list = wifi?.scanResults.orEmpty().map {
+                    AccessPoint(it.SSID.ifBlank { "(SSID oculto)" }, it.BSSID, it.frequency, it.level, it.timestamp)
+                }.sortedByDescending { it.rssi }
+                trySend(RadarState(list, message + if (list.isEmpty()) "\nNenhuma rede disponível." else ""))
+            } catch (_: SecurityException) {
+                trySend(RadarState(message = "Permissão indisponível ou revogada."))
+            }
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != WifiManager.SCAN_RESULTS_AVAILABLE_ACTION) return
+                read(if (intent.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, false))
+                    "Resultados recebidos. Confira a idade de cada medição."
+                else "Varredura não atualizada; exibindo resultados anteriores.")
+            }
+        }
+        ContextCompat.registerReceiver(app, receiver,
+            IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION), ContextCompat.RECEIVER_EXPORTED)
+        read("Últimos resultados disponibilizados pelo Android (podem ser antigos).")
+        val job = launch(Dispatchers.IO) {
+            while (true) {
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - prefs.lastScan
+                if (prefs.lastScan == 0L || elapsed < 0 || elapsed >= 35_000L) {
+                    if (ContextCompat.checkSelfPermission(app, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                        prefs.lastScan = now
+                        try {
+                            // Deprecated but still the official public API for active scanning.
+                            @Suppress("DEPRECATION")
+                            val accepted = wifi?.startScan() == true
+                            read(if (accepted) "Varredura solicitada; aguardando Android."
+                                else "Android limitou/recusou a varredura; resultados anteriores.")
+                        } catch (_: SecurityException) { read("Sem autorização para varrer.") }
+                    } else read("Localização precisa necessária.")
+                }
+                delay(35_000L)
+            }
+        }
+        awaitClose { job.cancel(); app.unregisterReceiver(receiver) }
+    }
+}
