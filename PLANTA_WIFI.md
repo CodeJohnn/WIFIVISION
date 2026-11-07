@@ -28,4 +28,4 @@ Mantido o teste HTTPS real de download, upload e latência HTTP/jitter, com cons
 - Importar uma imagem do provedor de arquivos do aparelho e reabrir a planta.
 - Conferir persistência após fechar/reabrir e compartilhar os arquivos exportados.
 - Teste de velocidade no Wi-Fi residencial, cancelamento e indisponibilidade do servidor.
-O RSSI e qualquer localização fornecidos pelo emulador não comprovam a cobertura da residência.
+O RSSI e qualquer localização fornecidos pelo emulador não comprovam a cobertura da residência apenas uma simulação.
